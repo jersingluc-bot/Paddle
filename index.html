@@ -116,7 +116,8 @@ const wmo = c => c === 0 ? 'Clear' : c <= 2 ? 'Partly cloudy' : c === 3 ? 'Overc
 
 async function getConditions([lat, lon]) {
   const ll = `latitude=${lat}&longitude=${lon}`;
-  const f = fetch(`https://api.open-meteo.com/v1/forecast?${ll}&current=temperature_2m,weather_code,wind_speed_10m,wind_gusts_10m,wind_direction_10m&wind_speed_unit=mph&timezone=Europe%2FLondon`).then(r => r.json());
+  const f = fetch(`https://api.open-meteo.com/v1/forecast?${ll}&current=temperature_2m,weather_code,wind_speed_10m,wind_gusts_10m,wind_direction_10m&wind_speed_unit=mph&timezone=Europe%2FLondon`)
+    .then(async r => { const j = await r.json(); if (!r.ok || !j.current) throw new Error(j.reason || 'HTTP ' + r.status); return j; });
   // Marine data is missing inland; treat failure as "no sea data".
   const m = fetch(`https://marine-api.open-meteo.com/v1/marine?${ll}&current=wave_height,wave_period,swell_wave_height`).then(r => r.ok ? r.json() : null).catch(() => null);
   const [fc, ma] = await Promise.all([f, m]);
@@ -169,7 +170,7 @@ async function openSpot(spot) {
 
   getConditions(spot.latlng)
     .then(c => { if (id === current) $('#cond').outerHTML = conditionsHTML(c); })
-    .catch(() => { if (id === current) $('#cond').textContent = "Couldn't load conditions."; });
+    .catch(e => { if (id === current) $('#cond').textContent = "Couldn't load conditions (" + (e && e.message || e) + ")."; });
 
   const [lat, lon] = spot.latlng;
   overpass(`[out:json][timeout:25];nwr["amenity"="parking"]["access"!~"private|no"](around:800,${lat},${lon});out center 30;`)
