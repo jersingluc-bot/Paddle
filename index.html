@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>UK Paddle</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="UK Paddle">
+<meta name="theme-color" content="#0e7490">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+  :root { --bg:#fff; --fg:#0f172a; --muted:#64748b; --line:#e2e8f0; --accent:#0e7490; --good:#16a34a; --warn:#f59e0b; --bad:#dc2626; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0f172a; --fg:#f1f5f9; --muted:#94a3b8; --line:#1e293b; } }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; font:16px/1.4 -apple-system,system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  #map { position:absolute; inset:0; }
+  #top { position:absolute; top:calc(env(safe-area-inset-top) + 10px); left:0; right:0; z-index:1000; display:flex; flex-direction:column; align-items:center; gap:6px; pointer-events:none; }
+  #top > * { pointer-events:auto; }
+  button { font:inherit; border:0; border-radius:999px; padding:10px 18px; background:var(--accent); color:#fff; font-weight:600; box-shadow:0 2px 8px #0004; cursor:pointer; }
+  button:disabled { opacity:.6; }
+  #status { background:var(--bg); color:var(--fg); padding:4px 12px; border-radius:999px; font-size:13px; box-shadow:0 1px 4px #0003; }
+  #status:empty { display:none; }
+  #locate { position:absolute; right:12px; bottom:calc(env(safe-area-inset-bottom) + 16px); z-index:1000; width:46px; height:46px; padding:0; font-size:22px; background:var(--bg); color:var(--fg); }
+  #sheet { position:absolute; left:0; right:0; bottom:0; z-index:1100; max-height:72%; overflow:auto; background:var(--bg); border-radius:18px 18px 0 0; box-shadow:0 -4px 20px #0005; padding:16px 16px calc(env(safe-area-inset-bottom) + 16px); transform:translateY(105%); transition:transform .25s; }
+  #sheet.open { transform:none; }
+  #sheet h2 { margin:0 40px 2px 0; font-size:20px; }
+  #close { position:absolute; top:12px; right:12px; width:34px; height:34px; padding:0; background:var(--line); color:var(--fg); box-shadow:none; }
+  .sub { color:var(--muted); font-size:14px; }
+  h3 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin:18px 0 6px; }
+  .verdict { display:flex; align-items:center; gap:10px; font-weight:700; font-size:18px; }
+  .dot { width:14px; height:14px; border-radius:50%; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
+  .cell { border:1px solid var(--line); border-radius:12px; padding:10px; }
+  .cell b { display:block; font-size:18px; }
+  .arrow { display:inline-block; font-size:20px; transition:transform .3s; }
+  .row { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:10px 0; border-bottom:1px solid var(--line); }
+  a.btn { display:inline-block; background:var(--accent); color:#fff; text-decoration:none; padding:7px 12px; border-radius:999px; font-size:14px; font-weight:600; white-space:nowrap; }
+  a.btn.alt { background:var(--line); color:var(--fg); }
+  .disc { font-size:12px; color:var(--muted); margin-top:16px; }
+  .leaflet-container { font:inherit; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="top">
+  <button id="search">Search this area</button>
+  <div id="status"></div>
+</div>
+<button id="locate" aria-label="My location">◎</button>
+<div id="sheet" role="dialog" aria-live="polite"><button id="close" aria-label="Close">✕</button><div id="content"></div></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const map = L.map('map', { zoomControl:false }).setView([50.15, -5.07], 11);   // Falmouth
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom:19, attribution:'© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+}).addTo(map);
+
+const markers = L.layerGroup().addTo(map);
+let meDot = null;
+
+// ---------- helpers ----------
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const status = t => $('#status').textContent = t || '';
+const dist = (a, b) => map.distance(a, b);
+
+async function overpass(ql) {
+  // The free public server is sometimes busy: retry a couple of times.
+  const s = 'https://overpass-api.de/api/interpreter';
+  let err;
+  for (let i = 0; i < 3; i++) {
+    if (i) await new Promise(r => setTimeout(r, 1500 * i));
+    try {
+      const r = await fetch(s, { method:'POST', body:'data=' + encodeURIComponent(ql), signal:AbortSignal.timeout(12000) });
+      if (!r.ok) throw new Error(r.status);
+      return (await r.json()).elements;
+    } catch (e) { err = e; }
+  }
+  throw err;
+}
+const pos = e => e.lat != null ? [e.lat, e.lon] : e.center ? [e.center.lat, e.center.lon] : null;
+
+// ---------- launch points ----------
+async function search() {
+  const c = map.getCenter();
+  // Cap the search radius so zoomed-out views don't hammer the free server.
+  const r = Math.min(20000, Math.max(3000, Math.round(map.distance(c, map.getBounds().getNorthEast()))));
+  const a = `(around:${r},${c.lat},${c.lng})`;
+  $('#search').disabled = true; status('Searching…');
+  try {
+    const els = await overpass(`[out:json][timeout:25];(nwr["leisure"="slipway"]${a};nwr["canoe"~"put_in|access"]${a};);out center 300;`);
+    markers.clearLayers();
+    let n = 0;
+    for (const e of els) {
+      const p = pos(e); if (!p) continue;
+      const t = e.tags || {};
+      const kind = t.leisure === 'slipway' ? 'Slipway' : 'Canoe access';
+      const m = L.circleMarker(p, { radius:9, color:'#fff', weight:2, fillColor:'#0e7490', fillOpacity:1 }).addTo(markers);
+      m.on('click', () => openSpot({ name:t.name || kind, kind, latlng:p }));
+      n++;
+    }
+    status(n ? `${n} launch points` : 'None found here. Move the map and search again.');
+  } catch { status("Couldn't load launch points. Try again."); }
+  $('#search').disabled = false;
+}
+
+// ---------- conditions ----------
+const compass = d => ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'][Math.round(d / 22.5) % 16];
+const wmo = c => c === 0 ? 'Clear' : c <= 2 ? 'Partly cloudy' : c === 3 ? 'Overcast' : (c === 45 || c === 48) ? 'Fog'
+  : (c >= 51 && c <= 57) ? 'Drizzle' : ((c >= 61 && c <= 67) || (c >= 80 && c <= 82)) ? 'Rain'
+  : ((c >= 71 && c <= 77) || c === 85 || c === 86) ? 'Snow' : c >= 95 ? 'Thunderstorm' : 'Unknown';
+
+async function getConditions([lat, lon]) {
+  const ll = `latitude=${lat}&longitude=${lon}`;
+  const f = fetch(`https://api.open-meteo.com/v1/forecast?${ll}&current=temperature_2m,weather_code,wind_speed_10m,wind_gusts_10m,wind_direction_10m&wind_speed_unit=mph&timezone=Europe%2FLondon`).then(r => r.json());
+  // Marine data is missing inland; treat failure as "no sea data".
+  const m = fetch(`https://marine-api.open-meteo.com/v1/marine?${ll}&current=wave_height,wave_period,swell_wave_height`).then(r => r.ok ? r.json() : null).catch(() => null);
+  const [fc, ma] = await Promise.all([f, m]);
+  return { ...fc.current, sea: ma && ma.current ? ma.current : {} };
+}
+
+// Rule of thumb for a moderately experienced sea kayak / SUP paddler. Not a marine forecast.
+function assess(c) {
+  let v = 0; const why = [];
+  const bump = (n, t) => { v = Math.max(v, n); why.push(t); };
+  if (c.wind_gusts_10m >= 25) bump(2, `Gusts ${Math.round(c.wind_gusts_10m)} mph`);
+  else if (c.wind_gusts_10m >= 15) bump(1, `Gusts ${Math.round(c.wind_gusts_10m)} mph`);
+  const w = c.sea.wave_height;
+  if (w != null) { if (w >= 1) bump(2, `Waves ${w.toFixed(1)} m`); else if (w >= 0.5) bump(1, `Waves ${w.toFixed(1)} m`); }
+  if (c.weather_code >= 95) bump(2, 'Thunderstorm'); else if (c.weather_code === 45 || c.weather_code === 48) bump(1, 'Fog');
+  if (!why.length) why.push('Light wind and calm water');
+  return { v, why, label:['Good to go', 'Caution', 'Not advised'][v], color:['var(--good)', 'var(--warn)', 'var(--bad)'][v] };
+}
+
+function conditionsHTML(c) {
+  const a = assess(c), s = c.sea;
+  return `<div class="verdict"><span class="dot" style="background:${a.color}"></span>${a.label}</div>
+    <div class="sub">${esc(a.why.join(' · '))}</div>
+    <div class="grid">
+      <div class="cell"><span class="sub">Wind</span><b>${Math.round(c.wind_speed_10m)} mph</b><span class="sub">gusts ${Math.round(c.wind_gusts_10m)}</span></div>
+      <div class="cell"><span class="sub">Direction</span><b><span class="arrow" style="transform:rotate(${c.wind_direction_10m + 180}deg)">↑</span> ${compass(c.wind_direction_10m)}</b><span class="sub">blowing from</span></div>
+      <div class="cell"><span class="sub">Weather</span><b>${wmo(c.weather_code)}</b><span class="sub">${Math.round(c.temperature_2m)}°C</span></div>
+      <div class="cell"><span class="sub">Sea state</span>${s.wave_height != null
+        ? `<b>${s.wave_height.toFixed(1)} m</b><span class="sub">${s.wave_period ? Math.round(s.wave_period) + 's period' : ''}${s.swell_wave_height != null ? ' · swell ' + s.swell_wave_height.toFixed(1) + ' m' : ''}</span>`
+        : `<b>–</b><span class="sub">No sea data (inland?)</span>`}</div>
+    </div>`;
+}
+
+// ---------- spot sheet ----------
+const apple = (p, m) => `https://maps.apple.com/?daddr=${p[0]},${p[1]}&dirflg=${m}`;
+const google = (p, m) => `https://www.google.com/maps/dir/?api=1&destination=${p[0]},${p[1]}&travelmode=${m === 'd' ? 'driving' : 'walking'}`;
+const isApple = /iPhone|iPad|Macintosh/.test(navigator.userAgent);
+const dir = (p, m) => isApple ? apple(p, m) : google(p, m);
+let current = 0;
+
+async function openSpot(spot) {
+  const id = ++current;   // ignore stale responses if the user taps another spot
+  $('#content').innerHTML = `<h2>${esc(spot.name)}</h2><div class="sub">${spot.kind}</div>
+    <h3>Conditions now</h3><div id="cond" class="sub">Loading…</div>
+    <h3>Car parks nearby</h3><div id="cars" class="sub">Loading…</div>
+    <h3>Directions</h3><div class="row"><span>Walk to launch point</span><a class="btn alt" href="${dir(spot.latlng, 'w')}" target="_blank" rel="noopener">Walk</a></div>
+    <p class="disc">Guide only. Check tides, local hazards and the Met Office inshore waters forecast before you go.</p>`;
+  $('#sheet').classList.add('open');
+  map.panTo(spot.latlng);
+
+  getConditions(spot.latlng)
+    .then(c => { if (id === current) $('#cond').outerHTML = conditionsHTML(c); })
+    .catch(() => { if (id === current) $('#cond').textContent = "Couldn't load conditions."; });
+
+  const [lat, lon] = spot.latlng;
+  overpass(`[out:json][timeout:25];nwr["amenity"="parking"]["access"!~"private|no"](around:800,${lat},${lon});out center 30;`)
+    .then(els => {
+      if (id !== current) return;
+      const cars = els.map(e => ({ p:pos(e), t:e.tags || {} })).filter(x => x.p)
+        .map(x => ({ ...x, d:Math.round(dist(spot.latlng, x.p)) })).sort((a, b) => a.d - b.d).slice(0, 5);
+      $('#cars').outerHTML = cars.length ? `<div>${cars.map(x => `<div class="row"><div>${esc(x.t.name || 'Car park')}<div class="sub">${x.d} m from launch${x.t.fee ? ' · ' + (x.t.fee === 'yes' ? 'Pay' : x.t.fee === 'no' ? 'Free' : esc(x.t.fee)) : ''}</div></div><a class="btn" href="${dir(x.p, 'd')}" target="_blank" rel="noopener">Drive</a></div>`).join('')}</div>`
+        : `<div class="sub">None found within 800 m.</div>`;
+    })
+    .catch(() => { if (id === current) $('#cars').textContent = "Couldn't load car parks."; });
+}
+
+// ---------- wiring ----------
+$('#search').onclick = search;
+$('#close').onclick = () => $('#sheet').classList.remove('open');
+map.on('click', () => $('#sheet').classList.remove('open'));
+$('#locate').onclick = () => {
+  if (!navigator.geolocation) return status('Location not available.');
+  navigator.geolocation.getCurrentPosition(p => {
+    const ll = [p.coords.latitude, p.coords.longitude];
+    if (meDot) meDot.remove();
+    meDot = L.circleMarker(ll, { radius:7, color:'#fff', weight:3, fillColor:'#2563eb', fillOpacity:1 }).addTo(map);
+    map.setView(ll, 12); search();
+  }, () => status('Location permission denied.'), { timeout:10000 });
+};
+search();
+</script>
+</body>
+</html>
